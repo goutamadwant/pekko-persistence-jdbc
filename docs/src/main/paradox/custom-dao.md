@@ -53,9 +53,22 @@ matches no snapshots. Both built-in snapshot DAOs support these criteria.
 The existing upper-bound methods remain available. The default implementations of the
 criteria methods delegate to those methods when both minimum bounds are zero, preserving
 existing custom DAO behavior for those requests. For nonzero minimum bounds, the defaults
-return a failed future with `UnsupportedOperationException`. Custom DAOs must override
-the criteria methods to support these requests. In particular, a bounded delete must not
-fall back to an upper-bound-only delete, which could remove snapshots outside the interval.
+are built from the upper-bound methods and never widen the requested interval:
+
+* `snapshotForCriteria` loads the highest snapshot within the upper bounds with
+  `snapshotForMaxSequenceNrAndMaxTimestamp` and returns it only if it also satisfies the
+  minimum bounds. Any older snapshot has a lower sequence number and, as timestamps do not
+  decrease with the sequence number, a lower timestamp, so it cannot match either.
+* `deleteByCriteria` deletes matching snapshots one at a time. It loads the highest snapshot
+  within the upper bounds, deletes it with `delete` if it satisfies the minimum bounds, and
+  repeats from the sequence number below it until a snapshot falls outside the interval.
+  Apache Pekko Persistence Typed retention issues such bounded deletes, and the interval
+  spans the retained snapshot window, so this costs one load and one delete per retained
+  snapshot.
+
+Custom DAOs may override the criteria methods to apply all four bounds in a single query or
+statement, as both built-in snapshot DAOs do. A bounded delete must not fall back to an
+upper-bound-only delete, which could remove snapshots outside the interval.
 
 For more information please review the two default implementations `org.apache.pekko.persistence.jdbc.dao.bytea.journal.ByteArrayJournalDao` and `org.apache.pekko.persistence.jdbc.dao.bytea.snapshot.ByteArraySnapshotDao` or the demo custom DAO example from the [demo-akka-persistence](https://github.com/dnvriend/demo-akka-persistence-jdbc) site.
 

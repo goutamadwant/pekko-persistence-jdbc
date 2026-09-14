@@ -16,14 +16,17 @@ package org.apache.pekko.persistence.jdbc.snapshot.dao
 
 import org.apache.pekko.persistence.{ SnapshotMetadata, SnapshotSelectionCriteria }
 
-import scala.concurrent.Future
+import scala.concurrent.{ ExecutionContext, Future }
 
 trait SnapshotDao {
 
   /**
    * Load the snapshot with the highest sequence number matching all inclusive criteria bounds.
-   * The default preserves upper-bound-only queries. Custom DAOs must override this method to
-   * support nonzero minimum bounds; otherwise the returned future fails explicitly.
+   * The default delegates to the upper-bound methods when both minimum bounds are zero. For
+   * nonzero minimum bounds it loads the highest snapshot within the upper bounds and returns it
+   * only if it also satisfies the minimum bounds: any older snapshot has a lower sequence number
+   * and, as timestamps do not decrease with the sequence number, a lower timestamp as well.
+   * Custom DAOs may override this method to apply all four bounds in a single query.
    */
   def snapshotForCriteria(
       persistenceId: String,
@@ -37,15 +40,22 @@ trait SnapshotDao {
         snapshotForMaxSequenceNr(persistenceId, maxSequenceNr)
       case SnapshotSelectionCriteria(maxSequenceNr, maxTimestamp, 0L, 0L) =>
         snapshotForMaxSequenceNrAndMaxTimestamp(persistenceId, maxSequenceNr, maxTimestamp)
-      case _ =>
-        Future.failed(new UnsupportedOperationException(
-          "SnapshotDao must override snapshotForCriteria to support nonzero minimum bounds"))
+      case SnapshotSelectionCriteria(maxSequenceNr, maxTimestamp, minSequenceNr, minTimestamp) =>
+        snapshotForMaxSequenceNrAndMaxTimestamp(persistenceId, maxSequenceNr, maxTimestamp)
+          .map(_.filter { case (metadata, _) =>
+            metadata.sequenceNr >= minSequenceNr && metadata.timestamp >= minTimestamp
+          })(ExecutionContext.parasitic)
     }
 
   /**
    * Delete only snapshots matching all inclusive criteria bounds for this persistence ID.
-   * The default preserves upper-bound-only deletes and fails for nonzero minimum bounds.
-   * Custom DAOs must override this method to support bounded deletion without widening its range.
+   * The default delegates to the upper-bound methods when both minimum bounds are zero. For
+   * nonzero minimum bounds it never widens the range: it deletes matching snapshots one at a
+   * time, loading the highest snapshot within the upper bounds via
+   * `snapshotForMaxSequenceNrAndMaxTimestamp`, deleting it with `delete` if it satisfies the
+   * minimum bounds, and continuing from the sequence number below it until a snapshot falls
+   * outside the interval. Custom DAOs may override this method to apply all four bounds in a
+   * single statement.
    */
   def deleteByCriteria(persistenceId: String, criteria: SnapshotSelectionCriteria): Future[Unit] =
     criteria match {
@@ -57,9 +67,19 @@ trait SnapshotDao {
         deleteUpToMaxSequenceNr(persistenceId, maxSequenceNr)
       case SnapshotSelectionCriteria(maxSequenceNr, maxTimestamp, 0L, 0L) =>
         deleteUpToMaxSequenceNrAndMaxTimestamp(persistenceId, maxSequenceNr, maxTimestamp)
-      case _ =>
-        Future.failed(new UnsupportedOperationException(
-          "SnapshotDao must override deleteByCriteria to support nonzero minimum bounds"))
+      case SnapshotSelectionCriteria(maxSequenceNr, maxTimestamp, minSequenceNr, minTimestamp) =>
+        def deleteDescending(upperSequenceNr: Long): Future[Unit] =
+          if (upperSequenceNr < minSequenceNr) Future.unit
+          else
+            snapshotForMaxSequenceNrAndMaxTimestamp(persistenceId, upperSequenceNr, maxTimestamp).flatMap {
+              case Some((metadata, _))
+                  if metadata.sequenceNr <= upperSequenceNr && metadata.sequenceNr >= minSequenceNr &&
+                  metadata.timestamp >= minTimestamp =>
+                delete(persistenceId, metadata.sequenceNr)
+                  .flatMap(_ => deleteDescending(metadata.sequenceNr - 1))(ExecutionContext.parasitic)
+              case _ => Future.unit
+            }(ExecutionContext.parasitic)
+        deleteDescending(maxSequenceNr)
     }
 
   def deleteAllSnapshots(persistenceId: String): Future[Unit]
